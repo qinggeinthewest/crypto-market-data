@@ -322,47 +322,72 @@ async function gateValidatedSnapshot(){
  const assets=Object.fromEntries(COINS.map((c,i)=>[c,res[i].status==="fulfilled"?res[i].value:
   {pair:c+"_USDT",status:"UNKNOWN",errors:[String(res[i].reason)]}]));
  const ready=Object.values(assets).filter(v=>v.status==="READY").length;
- return {schema_version:"0.2.0",generated_at_utc:iso(now),source:"Gate Global SPOT public REST",
+ return {schema_version:"0.3.0",generated_at_utc:iso(now),source:"Gate Global SPOT public REST",
   dataset_status:ready===6?"READY":"INCOMPLETE",ready_symbols:ready,total_symbols:6,
   data_scope:"Latest verified quotes and last four completed 4H/1D candles; not long-term history.",
   limitations:"No OI, liquidation, funding, full multi-venue redundancy or trade execution.",
   assets};
 }
+// Phase 2B: Workers Free D1 storage (no paid R2 required).
+// The Worker has exactly one scheduled write opportunity per 15-minute UTC slot.
+// Endpoint /snapshot remains read-only; /latest reads saved D1 snapshots.
+const D1_SLOT_MS=15*60*1000;
+const D1_KEEP_DAYS=30;
+const D1_MAX_BYTES=160000;
+const D1_SQL_CREATE="CREATE TABLE IF NOT EXISTS crypto_snapshots ("+
+ "slot INTEGER PRIMARY KEY, collected_at_ms INTEGER NOT NULL, "+
+ "status TEXT NOT NULL, ready_count INTEGER NOT NULL, payload TEXT NOT NULL)";
+const D1_SQL_UPSERT="INSERT INTO crypto_snapshots (slot,collected_at_ms,status,ready_count,payload) "+
+ "VALUES (?1,?2,?3,?4,?5) ON CONFLICT(slot) DO UPDATE SET "+
+ "collected_at_ms=excluded.collected_at_ms,status=excluded.status,"+
+ "ready_count=excluded.ready_count,payload=excluded.payload "+
+ "WHERE excluded.ready_count>crypto_snapshots.ready_count";
 async function saveGateSnapshot(env,snapshot,trigger){
- if(!env?.MARKET_ARCHIVE)return {storage:"NOT_CONFIGURED",persisted:false};
- const stamp=snapshot.generated_at_utc.replace(/[:.]/g,"-");
- const day=snapshot.generated_at_utc.slice(0,10).replaceAll("-","/");
- const key="snapshots/"+day+"/"+stamp+".json";
- const info={timestamp_utc:snapshot.generated_at_utc,trigger,
-  dataset_status:snapshot.dataset_status,ready_symbols:snapshot.ready_symbols,
-  schema_version:snapshot.schema_version,archive_key:key};
- const opts={httpMetadata:{contentType:"application/json"}};
- // Keep every attempted poll separately; the latest-good pointer updates only on 6/6 success.
- await env.MARKET_ARCHIVE.put(key,JSON.stringify(snapshot),opts);
- if(snapshot.dataset_status==="READY")
-  await env.MARKET_ARCHIVE.put("current/latest.json",JSON.stringify(snapshot),opts);
- await env.MARKET_ARCHIVE.put("current/status.json",JSON.stringify(info),opts);
- return {storage:"R2",persisted:true,archive_key:key,latest_good_updated:snapshot.dataset_status==="READY"};
+ const db=env?.MARKET_DB;
+ if(!db)return {storage:"NOT_CONFIGURED",persisted:false,
+  next_step:"Create D1 crypto-market-db and bind as MARKET_DB"};
+ const now=Date.parse(snapshot.generated_at_utc);
+ if(!Number.isFinite(now))throw Error("SNAPSHOT_TIME_INVALID");
+ const slot=Math.floor(now/D1_SLOT_MS),payload=JSON.stringify(snapshot);
+ const bytes=new TextEncoder().encode(payload).length;
+ if(bytes>D1_MAX_BYTES)throw Error("D1_SNAPSHOT_SIZE_CAP_EXCEEDED_"+bytes);
+ await db.prepare(D1_SQL_CREATE).run();
+ const write=await db.prepare(D1_SQL_UPSERT).bind(slot,now,snapshot.dataset_status,
+  snapshot.ready_symbols,payload).run();
+ // Retention maintenance once daily; no unbounded data growth.
+ if(slot%96===0){
+  const cutoff=slot-D1_KEEP_DAYS*96;
+  await db.prepare("DELETE FROM crypto_snapshots WHERE slot < ?1").bind(cutoff).run();
+ }
+ return {storage:"D1",persisted:write.success!==false,slot,
+  bytes,write_count:write.meta?.rows_written??null,trigger,
+  retention_days:D1_KEEP_DAYS};
 }
 async function gateLastSaved(env){
- if(!env?.MARKET_ARCHIVE)return {status:"STORAGE_NOT_CONFIGURED"};
- const [obj,statusObj]=await Promise.all([
-  env.MARKET_ARCHIVE.get("current/latest.json"),env.MARKET_ARCHIVE.get("current/status.json")
- ]);
- if(!obj)return {status:"NO_SAVED_GOOD_SNAPSHOT",last_attempt:statusObj?await statusObj.json():null};
- const content=await obj.json(),age=Date.now()-Date.parse(content.generated_at_utc);
- return {status:age<=30*60000&&age>=-60000?"FRESH":"STALE",
-  age_minutes:Math.round(age/60000),
-  last_attempt:statusObj?await statusObj.json():null,
-  snapshot:content};
+ const db=env?.MARKET_DB;
+ if(!db)return {status:"STORAGE_NOT_CONFIGURED",storage:"D1",persistence_enabled:false};
+ try{
+  const [last,good]=await Promise.all([
+   db.prepare("SELECT slot,collected_at_ms,status,ready_count FROM crypto_snapshots ORDER BY slot DESC LIMIT 1").first(),
+   db.prepare("SELECT payload,collected_at_ms FROM crypto_snapshots WHERE status='READY' ORDER BY slot DESC LIMIT 1").first()
+  ]);
+  if(!good)return {status:"NO_SAVED_GOOD_SNAPSHOT",storage:"D1",last_attempt:last||null};
+  const content=JSON.parse(good.payload);
+  const age=Date.now()-Number(good.collected_at_ms);
+  const fresh=age>=-60000&&age<=30*60000;
+  return {status:fresh?"FRESH":"STALE",storage:"D1",age_minutes:Math.round(age/60000),
+   last_attempt:last||null,snapshot:content};
+ }catch(e){return {status:"STORAGE_QUERY_FAILED",storage:"D1",
+  error:String(e?.message||e).slice(0,200)};}
 }
+
 
 export default {
  async fetch(request,env){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
   if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.2.0",
-   worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_ARCHIVE),at_utc:iso(Date.now())});
+   worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_DB),at_utc:iso(Date.now())});
   if(url.pathname==="/gate-trades"){
    try{return respond(await gateTradeFreshness());}
    catch(e){return respond({qualification:"INCOMPLETE",error:String(e)},503);}
@@ -384,14 +409,14 @@ export default {
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
   if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/sources","/gate-snapshot","/gate-trades"],
-   phase:"1: read-only probes"});
+   phase:"2B: Gate read-only probes plus D1 cron persistence when binding configured"});
   return respond({error:"NOT_FOUND"},404);
  },
  async scheduled(controller,env){
   const snapshot=await gateValidatedSnapshot();
   let saved;
   try{saved=await saveGateSnapshot(env,snapshot,"cron");}
-  catch(e){console.error("R2_STORAGE_FAILURE",String(e));throw e;}
+  catch(e){console.error("D1_STORAGE_FAILURE",String(e));throw e;}
   console.log(JSON.stringify({event:"gate-spot-collector",
    scheduled_at_utc:iso(controller.scheduledTime),status:snapshot.dataset_status,
    ready:snapshot.ready_symbols,persistence:saved,
@@ -399,6 +424,6 @@ export default {
      .filter(([,a])=>a.status!=="READY").map(([coin,a])=>[coin,a.errors]))}));
   if(snapshot.dataset_status!=="READY")
    throw Error("GATE_DATA_INCOMPLETE_"+snapshot.ready_symbols+"_OF_6");
-  if(!saved.persisted)console.warn("GATE_READY_BUT_NOT_PERSISTED: Create and bind Cloudflare R2 MARKET_ARCHIVE");
+  if(!saved.persisted)console.warn("GATE_READY_BUT_NOT_PERSISTED: Create and bind Cloudflare D1 MARKET_DB");
  }
 };
