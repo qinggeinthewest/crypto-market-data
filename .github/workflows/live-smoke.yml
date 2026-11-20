@@ -14,30 +14,28 @@ jobs:
           WORKER_URL: https://crypto-market-data.qinggeinthewest.workers.dev
         run: |
           set -euo pipefail
-          ok=0
-          for attempt in $(seq 1 15); do
-            response=$(curl --retry 1 -fsS --connect-timeout 5 --max-time 12 "$WORKER_URL/health" || true)
-            echo "Health attempt $attempt: $response"
-            if [[ "$response" == *'"version":"0.4.0-phase3a"'* ]] && [[ "$response" == *'"persistence_enabled":true'* ]]; then
-              ok=1
-              break
-            fi
-            sleep 10
-          done
-          if [ "$ok" -ne 1 ]; then
-            echo "::error::Live Worker version or D1 binding not verified. GitHub merge does not prove Cloudflare deployment."
+          response=$(curl -fsS --connect-timeout 5 --max-time 15 "$WORKER_URL/health")
+          echo "$response" | jq -c '{service,version,worker_running,persistence_enabled,at_utc}'
+          if ! echo "$response" | jq -e '.version == "0.4.0-phase3a" and .worker_running == true and .persistence_enabled == true' >/dev/null; then
+            echo "::error::Live Worker version or D1 binding not verified"
             exit 1
           fi
-      - name: Verify new read-only endpoints
+      - name: Verify deployed derivatives read-only endpoints
         env:
           WORKER_URL: https://crypto-market-data.qinggeinthewest.workers.dev
         run: |
           set -euo pipefail
-          for route in derivatives-audit derivatives-latest; do
-            result=$(curl -fsS --connect-timeout 5 --max-time 15 "$WORKER_URL/$route")
-            echo "$route response: ${result:0:1200}"
-            if [[ "$result" != *'"status":'* ]]; then
+          for route in derivatives-audit derivatives-latest audit; do
+            echo "Checking $route"
+            response=$(curl -fsS --connect-timeout 5 --max-time 20 "$WORKER_URL/$route")
+            echo "$response" | jq -c '{status,checked_at_utc,storage,expected_slots_since_first_record,recorded_slots,ready_slots,latest_age_minutes,assets: (if .assets then (.assets | with_entries(.value = {recorded_slots: .value.recorded_slots,complete_slots: .value.complete_slots,latest: .value.latest,latest_sample_utc: .value.latest_sample_utc, fresh: .value.fresh, sample_age_minutes: .value.sample_age_minutes})) else null end)}'
+            if ! echo "$response" | jq -e '.status | type=="string"' >/dev/null; then
               echo "::error::Missing JSON status from /$route"
+              exit 1
+            fi
+            status=$(echo "$response" | jq -r '.status')
+            if [[ "$status" == "STORAGE_NOT_CONFIGURED" || "$status" == "D1_QUERY_FAILED" || "$status" == "NO_PERSISTED_RUNS" ]]; then
+              echo "::error::/$route returned $status: code is deployed but historical data not yet verified."
               exit 1
             fi
           done
