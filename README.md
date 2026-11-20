@@ -11,7 +11,7 @@
 ## Phase 3A 衍生品采集
 - Gate futures/usdt/contract_stats：每币最近24个5分钟样本，过滤未闭合、过期和无效记录；存储 OI 合约数、OI USD 名义价值及 5m 强平美元金额。
 - Gate futures/usdt/funding_rate：每币最近4条历史已结算资金费率，不能当成未来费率预测。
-- Gate futures/usdt/liq_orders：每币最近30分钟公开强平订单，15分钟 Cron 重叠抓取；接口无公开的 offset/cursor 分页。返回满100条时按时间窗拆分（每币最多4次请求），仍无法完整获取即标记 INCOMPLETE。
+- Gate futures/usdt/liq_orders：每币最近30分钟公开强平订单，15分钟 Cron 重叠抓取；接口无公开的 offset/cursor 分页。返回满100条时按时间窗拆分（每币最多4次请求，六币合计最多追加6次请求），仍无法完整获取即标记 INCOMPLETE。
 - 公开强平订单无唯一事件ID，用合约、秒级时间、订单大小及价格字段生成稳定指纹；完全相同字段的不同事件可能被合并，事件计数只能视为公开记录的下界。
 - 每轮每币最多保存80条去重强平订单；超限标记 INCOMPLETE，控制 D1 写入量。强平金额优先使用 contract_stats 5分钟聚合，不根据订单数猜测总金额。
 - 现货与衍生品在同一15分钟 Cron 内并行、独立保存，某项数据失败不阻止另一项持久化。
@@ -39,6 +39,6 @@ D1 新表：
 5. 连续24小时（96个时间槽）检查漏采和数据质量，再用3–7天观察初步稳定性；暂不把这些样本称为历史回测。
 6. Phase 3B 另行增加跨交易所校验、策略回测与信号判定。
 
-Cloudflare Free 的 D1/Workers 配额要持续核查；限额措施并不保证极端行情下绝不超配额。
+Workers Free 每次最多50次外部请求。当前单轮约24次现货 + 18次衍生品基础请求 + 最多6次强平拆分请求 = 48次，留2次余量。Cloudflare Free 的 D1/Workers 配额要持续核查；该设计仅限制程序发起的请求数量，意外重定向及其他消耗仍需监控。
 
 官方资料：https://www.gate.com/docs/developers/apiv4/en/futures/ ；https://developers.cloudflare.com/d1/worker-api/d1-database/ ；https://developers.cloudflare.com/d1/platform/pricing/
