@@ -1,0 +1,146 @@
+name: Publish public crypto data for ChatGPT monitoring
+on:
+  schedule:
+    - cron: '2,17,32,47 * * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/publish-monitor-feed.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crypto-public-feed-main
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Read only from the deployed Cloudflare Worker
+        env:
+          WORKER_URL: https://crypto-market-data.qinggeinthewest.workers.dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          fetch_or_mark_failed() {
+            local route="$1"
+            local output="$2"
+            if ! curl -fLsS --retry 2 --retry-delay 2 \
+               --connect-timeout 6 --max-time 25 \
+               "$WORKER_URL/$route" -o "$output"; then
+              echo '{"status":"FETCH_FAILED","assets":{}}' >"$output"
+            fi
+            if ! jq -e 'type=="object" and (.status|type=="string")' "$output" >/dev/null 2>&1; then
+              echo '{"status":"INVALID_RESPONSE","assets":{}}' >"$output"
+            fi
+          }
+          fetch_or_mark_failed latest-assets spot.json
+          fetch_or_mark_failed derivatives-latest futures.json
+          fetch_or_mark_failed derivatives-audit futures-audit.json
+          fetched_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          jq -cn --arg fetched "$fetched_at" \
+            --slurpfile sp spot.json --slurpfile fu futures.json \
+            --slurpfile au futures-audit.json '
+            {
+              schema_version:"public-monitor-feed-v1",
+              fetched_at_utc:$fetched,
+              source:"Cloudflare Worker public endpoints, mirrored by GitHub Actions",
+              source_urls:{
+                spot:"https://crypto-market-data.qinggeinthewest.workers.dev/latest-assets",
+                derivatives:"https://crypto-market-data.qinggeinthewest.workers.dev/derivatives-latest",
+                derivatives_audit:"https://crypto-market-data.qinggeinthewest.workers.dev/derivatives-audit"
+              },
+              spot:{
+                status:$sp[0].status,
+                checked_at_utc:$sp[0].checked_at_utc,
+                verified_coins:$sp[0].verified_coins,
+                verified_symbols:$sp[0].verified_symbols,
+                missing_or_unverified_symbols:$sp[0].missing_or_unverified_symbols,
+                freshness_rules:$sp[0].freshness_rules,
+                assets:($sp[0].assets // {} | with_entries(
+                  .value = {
+                    status:.value.status,
+                    collected_at_utc:.value.collected_at_utc,
+                    exchange_trade_at_utc:.value.exchange_trade_at_utc,
+                    snapshot_age_minutes:.value.snapshot_age_minutes,
+                    trade_age_minutes:.value.trade_age_minutes,
+                    quote_price_usdt:.value.data.quote.price_usdt,
+                    last_trade_price_usdt:.value.data.latest_trade.price_usdt,
+                    last_trade_utc:.value.data.latest_trade.exchange_time_utc,
+                    last_trade_errors:.value.last_attempt.errors,
+                    last_completed_4h_close_utc:.value.data.kline_4h.last_completed_close_utc,
+                    candles_4h:.value.data.kline_4h.recent_completed,
+                    last_completed_1d_close_utc:.value.data.kline_1d.last_completed_close_utc,
+                    candles_1d:.value.data.kline_1d.recent_completed
+                  }
+                ))
+              },
+              derivatives:{
+                status:$fu[0].status,
+                checked_at_utc:$fu[0].checked_at_utc,
+                venue:$fu[0].venue,
+                production_ready:$fu[0].production_ready,
+                trade_signal:$fu[0].trade_signal,
+                assets:($fu[0].assets // {} | with_entries(
+                  .value = {
+                    fresh:.value.fresh,
+                    sample_age_minutes:.value.sample_age_minutes,
+                    latest_sample_utc:.value.latest_sample_utc,
+                    latest_oi_usd:.value.latest_oi_usd,
+                    oi_change_1h:.value.oi_change_1h,
+                    oi_change_4h:.value.oi_change_4h,
+                    oi_change_24h:.value.oi_change_24h,
+                    liquidation_trend_30m:.value.liquidation_trend_30m,
+                    funding:.value.funding
+                  }
+                ))
+              },
+              derivatives_audit:{
+                status:$au[0].status,
+                checked_at_utc:$au[0].checked_at_utc,
+                expected_slots_since_first_record:$au[0].expected_slots_since_first_record,
+                assets:($au[0].assets // {} | with_entries(.value = {
+                  recorded_slots:.value.recorded_slots,
+                  complete_slots:.value.complete_slots,
+                  incomplete_slots:.value.incomplete_slots,
+                  missing_due_slots:.value.missing_due_slots,
+                  latest:.value.latest
+                }))
+              },
+              limitations:[
+                "Gate-only derivatives, not global liquidation totals",
+                "Gate public liquidation events may be incomplete; zero does not prove no liquidations",
+                "Historical funding settlement is not next funding forecast",
+                "Latest 4 complete 4h / 1d spot candles only; not enough for 20/50/200-day averages",
+                "GitHub Actions schedule may run late; always validate fetched_at and each underlying exchange timestamp",
+                "Do not generate buy/sell signals solely from this data"
+              ]
+            }' > data/market-latest.json
+          jq -e '.schema_version == "public-monitor-feed-v1" and (.spot.assets|type=="object") and (.derivatives.assets|type=="object")' data/market-latest.json >/dev/null
+          jq -c '{fetched_at_utc,spot_status:.spot.status,spot_verified:.spot.verified_symbols,derivatives_status:.derivatives.status,derivatives_count:(.derivatives.assets|length),audit_status:.derivatives_audit.status}' data/market-latest.json
+          bytes=$(wc -c <data/market-latest.json)
+          if (( bytes > 100000 )); then
+            echo "::error::Public monitor feed exceeded 100 kB hard cap"
+            exit 1
+          fi
+      - name: Commit bounded public feed if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/market-latest.json
+          if git diff --cached --quiet; then
+            echo "No change"
+            exit 0
+          fi
+          git commit -m "data: update public crypto monitor feed [skip ci]"
+          git push
