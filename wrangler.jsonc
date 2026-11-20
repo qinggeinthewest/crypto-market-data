@@ -3,6 +3,19 @@
   "main": "src/index.js",
   "compatibility_date": "2026-11-01",
   "workers_dev": true,
-  "triggers": { "crons": ["*/15 * * * *"] },
-  "observability": { "enabled": true }
+  "triggers": {
+    "crons": [
+      "*/15 * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "MARKET_DB",
+      "database_name": "crypto-market-db",
+      "database_id": "6ebfd726-ee88-4061-ae4d-e9890522d85b"
+    }
+  ]
 }
