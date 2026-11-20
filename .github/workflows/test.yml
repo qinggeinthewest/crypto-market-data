@@ -1,0 +1,19 @@
+name: Crypto data unit tests
+on:
+  push:
+    branches: [main, feature/phase3a-derivatives-d1]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check src/index.js
+      - run: node --check src/derivatives.js
+      - run: npm test
