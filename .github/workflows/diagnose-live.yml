@@ -1,0 +1,35 @@
+name: Inspect live market data quality
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/diagnose-live.yml
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    permissions:
+      contents: read
+    steps:
+      - name: Read deployed public diagnostic endpoints
+        env:
+          WORKER_URL: https://crypto-market-data.qinggeinthewest.workers.dev
+        run: |
+          set -euo pipefail
+          for route in health audit latest snapshot derivatives-audit derivatives-latest; do
+            echo "======== /$route ========"
+            code=$(curl -sS --connect-timeout 5 --max-time 35 -o response.json -w "%{http_code}" "$WORKER_URL/$route" || true)
+            echo "HTTP status: $code"
+            if ! jq -e . response.json >/dev/null 2>&1; then
+              echo "Invalid or unavailable JSON"
+              continue
+            fi
+            case "$route" in
+              health) jq -c '{version,worker_running,persistence_enabled,at_utc}' response.json;;
+              audit) jq -c '{status,checked_at_utc,recorded_slots,ready_slots,incomplete_slots,missing_slots_since_first_observation,first_missing_slot_utc,last_observed_utc}' response.json;;
+              latest) jq -c '{status,age_minutes,last_attempt,snapshot_status:.snapshot.dataset_status,snapshot_time:.snapshot.generated_at_utc,snapshot_assets:(.snapshot.assets // {} | with_entries(.value = {status:.value.status,errors:.value.errors}))}' response.json;;
+              snapshot) jq -c '{dataset_status,generated_at_utc,ready_symbols,assets:(.assets // {} | with_entries(.value = {status:.value.status,errors:.value.errors,latest_trade:.value.latest_trade}))}' response.json;;
+              derivatives-audit) jq -c '{status,checked_at_utc,expected_slots_since_first_record,assets:(.assets // {} | with_entries(.value = {recorded_slots:.value.recorded_slots,complete_slots:.value.complete_slots,incomplete_slots:.value.incomplete_slots,missing_due_slots:.value.missing_due_slots,latest:.value.latest}))}' response.json;;
+              derivatives-latest) jq -c '{status,checked_at_utc,assets:(.assets // {} | with_entries(.value = {fresh:.value.fresh,latest_sample_utc:.value.latest_sample_utc,oi_change_1h:.value.oi_change_1h,oi_change_4h:.value.oi_change_4h,oi_change_24h:.value.oi_change_24h,liquidation_trend_30m:.value.liquidation_trend_30m}))}' response.json;;
+            esac
+          done
