@@ -387,32 +387,49 @@ async function gateLastSaved(env){
 async function gateStorageAudit(env){
  if(!env?.MARKET_DB)return {status:"STORAGE_NOT_CONFIGURED",storage:"D1"};
  const now=Date.now(),currentSlot=Math.floor(now/D1_SLOT_MS),startSlot=currentSlot-95;
+ const cronGraceMs=7*60000; // allow 7 minutes after each 15m Cron slot
+ const latestDueSlot=Math.floor((now-cronGraceMs)/D1_SLOT_MS);
  try{
   const q=await env.MARKET_DB.prepare(
    "SELECT slot,collected_at_ms,status,ready_count FROM crypto_snapshots "+
    "WHERE slot >= ?1 ORDER BY slot DESC LIMIT 96").bind(startSlot).all();
   const rows=q.results||[];
   if(!rows.length)return {status:"NO_PERSISTED_RUNS",storage:"D1",
-   period:"last_24h",checked_at_utc:iso(now)};
+   period:"last_24h",checked_at_utc:iso(now),
+   note:"No rows in last 24 hours. Check Cloudflare Cron Invocations."};
   const slots=new Map(rows.map(r=>[Number(r.slot),r]));
   const first=Math.min(...slots.keys()),last=Math.max(...slots.keys());
-  const missing=[];
-  for(let slot=first;slot<=last;slot++)if(!slots.has(slot))missing.push(iso(slot*D1_SLOT_MS));
+  // Count slots through the latest due Cron, not just through the latest stored row.
+  // Do not penalize the current slot until the 7-minute grace period has elapsed.
+  const expectedEnd=Math.max(last,latestDueSlot),missingBetween=[],missingAfter=[];
+  for(let slot=first;slot<=expectedEnd;slot++){
+   if(slots.has(slot))continue;
+   (slot>last?missingAfter:missingBetween).push(iso(slot*D1_SLOT_MS));
+  }
   const ready=rows.filter(r=>r.status==="READY"&&Number(r.ready_count)===6).length;
   const incomplete=rows.length-ready;
-  const latest=slots.get(last);
-  const ageMinutes=Math.round((now-Number(latest.collected_at_ms))/60000);
-  return {status:incomplete>0||missing.length>0?"ISSUES_DETECTED":
-   rows.length<4?"INSUFFICIENT_OBSERVATIONS":"NO_ISSUES_IN_OBSERVED_INTERVAL",
+  const latest=slots.get(last),ageMinutes=Math.round(
+   (now-Number(latest.collected_at_ms))/60000);
+  const expected=expectedEnd-first+1;
+  const missingTotal=missingBetween.length+missingAfter.length;
+  return {
+   status:incomplete>0||missingTotal>0?"ISSUES_DETECTED":
+    rows.length<4?"INSUFFICIENT_OBSERVATIONS":"NO_ISSUES_IN_OBSERVED_INTERVAL",
    storage:"D1",period:"rolling_24h",
    checked_at_utc:iso(now),first_observed_utc:iso(first*D1_SLOT_MS),
    last_observed_utc:iso(Number(latest.collected_at_ms)),
-   latest_age_minutes:ageMinutes,
+   latest_age_minutes:ageMinutes,cron_schedule:"every 15 minutes UTC",
+   cron_grace_minutes:7,
+   expected_slots_since_first_observation:expected,
    recorded_slots:rows.length,ready_slots:ready,incomplete_slots:incomplete,
-   missing_slots_between_first_and_last:missing.length,
-   first_missing_slot_utc:missing.slice(0,10),
+   missing_slots_between_first_and_last:missingBetween.length,
+   overdue_slots_after_last_record:missingAfter.length,
+   missing_slots_since_first_observation:missingTotal,
+   first_missing_slot_utc:[...missingBetween,...missingAfter].slice(0,10),
    ready_percent_among_recorded:Math.round(10000*ready/rows.length)/100,
-   disclaimer:"Missing count excludes time before first observation and after latest; not an SLA uptime guarantee. R2 and derivatives coverage remain unavailable."};
+   ready_percent_among_expected:Math.round(10000*ready/expected)/100,
+   disclaimer:"Counts start with the earliest stored row in the rolling 24h window; they cannot prove uptime before recording began. The 7-minute delay avoids flagging a recently scheduled run prematurely. No derivatives coverage yet."
+  };
  }catch(e){return {status:"D1_QUERY_FAILED",storage:"D1",
   error:String(e?.message||e).slice(0,220)};}
 }
@@ -421,7 +438,7 @@ export default {
  async fetch(request,env){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
-  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.3.0",
+  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.3.1",
    worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_DB),at_utc:iso(Date.now())});
   if(url.pathname==="/gate-trades"){
    try{return respond(await gateTradeFreshness());}
