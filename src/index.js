@@ -434,6 +434,99 @@ async function gateStorageAudit(env){
   error:String(e?.message||e).slice(0,220)};}
 }
 
+
+// Phase 3 exploratory futures probe. No persistence, no trade alerts, no auth.
+async function gateFuturesArray(path,params){
+ const url=new URL("https://api.gateio.ws/api/v4"+path);
+ for(const [k,v] of Object.entries(params))url.searchParams.set(k,String(v));
+ const res=await fetch(url.toString(),{
+  headers:{accept:"application/json"},signal:AbortSignal.timeout(8500)
+ });
+ if(!res.ok)throw Error("HTTP_"+res.status);
+ const data=await res.json();
+ if(!Array.isArray(data))throw Error("NON_ARRAY_FUTURES_RESPONSE");
+ return data;
+}
+async function gateDerivativesCoin(coin,atMs){
+ const contract=coin+"_USDT",nowSeconds=Math.floor(atMs/1000);
+ const requests=[
+  gateFuturesArray("/futures/usdt/contract_stats",{contract,interval:"5m",limit:3}),
+  gateFuturesArray("/futures/usdt/funding_rate",{contract,limit:2}),
+  gateFuturesArray("/futures/usdt/liq_orders",{contract,from:nowSeconds-1800,to:nowSeconds,limit:100})
+ ];
+ const settled=await Promise.allSettled(requests);
+ const out={contract,venue:"Gate Global USDT Perpetual",
+  market:"FUTURES",oi:{state:"UNKNOWN"},funding:{state:"UNKNOWN"},
+  liq_orders:{state:"UNKNOWN"},errors:[]};
+ if(settled[0].status==="fulfilled"){
+  const items=settled[0].value.filter(r=>Number.isFinite(Number(r?.time))&&
+   Number.isFinite(Number(r?.open_interest))&&Number(r.open_interest)>=0).sort((a,b)=>Number(b.time)-Number(a.time));
+  const rec=items[0],ts=Number(rec?.time)*1000;
+  if(rec&&ts<=atMs+60000&&atMs-ts<=30*60000){
+   out.oi={state:"VALID_GATED_STATS",sample_time_utc:iso(ts),
+    age_minutes:Math.round((atMs-ts)/60000),
+    open_interest_contracts:Number(rec.open_interest),
+    open_interest_usd:Number.isFinite(Number(rec.open_interest_usd))?
+     Number(rec.open_interest_usd):null,
+    aggregated_long_liq_usd:Number.isFinite(Number(rec.long_liq_usd_new??rec.long_liq_usd))?
+     Number(rec.long_liq_usd_new??rec.long_liq_usd):null,
+    aggregated_short_liq_usd:Number.isFinite(Number(rec.short_liq_usd_new??rec.short_liq_usd))?
+     Number(rec.short_liq_usd_new??rec.short_liq_usd):null,
+    note:"Exchange contract_stats aggregates; interval and coverage need further validation"};
+  }else out.oi={state:"NO_FRESH_OI_SAMPLE",rows_returned:settled[0].value.length};
+ }else{
+  out.oi={state:"REQUEST_FAILED",error:String(settled[0].reason).slice(0,130)};
+  out.errors.push("oi");
+ }
+ if(settled[1].status==="fulfilled"){
+  const items=settled[1].value.filter(r=>Number.isFinite(Number(r?.t))&&
+    Number.isFinite(Number(r?.r))).sort((a,b)=>Number(b.t)-Number(a.t));
+  if(items.length){
+   const newest=items[0];out.funding={state:"HISTORY_AVAILABLE",
+    latest_settlement_time_utc:iso(Number(newest.t)*1000),
+    rate:Number(newest.r),records_returned:items.length,
+    note:"Historical settlement rate, NOT current forecast"};
+  }else out.funding={state:"NO_VALID_HISTORY",rows_returned:settled[1].value.length};
+ }else{
+  out.funding={state:"REQUEST_FAILED",error:String(settled[1].reason).slice(0,130)};
+  out.errors.push("funding");
+ }
+ if(settled[2].status==="fulfilled"){
+  const arr=settled[2].value;
+  const filtered=arr.filter(r=>r?.contract===contract&&Number.isFinite(Number(r.time))&&
+   Number(r.time)>=nowSeconds-1800&&Number(r.time)<=nowSeconds+60);
+  const times=filtered.map(r=>Number(r.time));
+  out.liq_orders={state:arr.length>=100?"PAGINATION_REQUIRED":
+     filtered.length?"EVENTS_REPORTED":"ZERO_REPORTED_BY_GATE_NOT_MARKET_WIDE",
+   query_window_seconds:1800,raw_count:arr.length,valid_count:filtered.length,
+   earliest_reported_utc:times.length?iso(Math.min(...times)*1000):null,
+   latest_reported_utc:times.length?iso(Math.max(...times)*1000):null,
+   note:"Public exchange liquidation orders may be incomplete. Zero reported is not proof of no liquidations."};
+ }else{
+  out.liq_orders={state:"REQUEST_FAILED",error:String(settled[2].reason).slice(0,130)};
+  out.errors.push("liquidations");
+ }
+ return out;
+}
+async function gateDerivativeProbe(){
+ const at=Date.now();
+ const results=await Promise.allSettled(COINS.map(c=>gateDerivativesCoin(c,at)));
+ const assets=Object.fromEntries(COINS.map((coin,i)=>[coin,results[i].status==="fulfilled"?
+  results[i].value:{contract:coin+"_USDT",oi:{state:"UNKNOWN"},
+  funding:{state:"UNKNOWN"},liq_orders:{state:"UNKNOWN"},
+  errors:[String(results[i].reason).slice(0,180)]}]));
+ const coverage=Object.values(assets);
+ return {phase:"PUBLIC_DERIVATIVES_READ_ONLY_PROBE",
+  generated_at_utc:iso(at),venue:"Gate Global USDT perpetual",
+  oi_available:coverage.filter(x=>x.oi?.state==="VALID_GATED_STATS").length,
+  funding_available:coverage.filter(x=>x.funding?.state==="HISTORY_AVAILABLE").length,
+  liquidation_requests_responded:coverage.filter(x=>!["UNKNOWN","REQUEST_FAILED"].includes(x.liq_orders?.state)).length,
+  total_coins:6,
+  production_ready:false,
+  note:"One-time API reachability and field validation only; independent freshness audits, pagination, persistent event storage, cross-venue corroboration and continuous monitoring are still required.",
+  assets};
+}
+
 export default {
  async fetch(request,env){
   const url=new URL(request.url);
@@ -452,6 +545,10 @@ export default {
    try{return respond(await sourceDiagnostics());}
    catch(e){return respond({error:String(e)},503);}
   }
+  if(url.pathname==="/derivatives-probe"){
+   try{return respond(await gateDerivativeProbe());}
+   catch(e){return respond({phase:"PUBLIC_DERIVATIVES_READ_ONLY_PROBE",error:String(e)},503);}
+  }
   if(url.pathname==="/audit"){
    const report=await gateStorageAudit(env);
    return respond(report,report.status==="D1_QUERY_FAILED"||report.status==="STORAGE_NOT_CONFIGURED"?503:200);
@@ -464,7 +561,7 @@ export default {
    try{const data=await gateValidatedSnapshot();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/audit","/sources","/gate-snapshot","/gate-trades"],
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/audit","/derivatives-probe","/sources","/gate-snapshot","/gate-trades"],
    phase:"2B: Gate read-only probes plus D1 cron persistence when binding configured"});
   return respond({error:"NOT_FOUND"},404);
  },
