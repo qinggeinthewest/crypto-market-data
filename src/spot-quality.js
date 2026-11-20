@@ -24,7 +24,7 @@ export function mergeSpotRows(rows,at=Date.now()) {
       const tradeAge=at-tradeTime;
       const snapshotAge=at-ms;
       if(!Number.isFinite(tradeTime)||tradeAge < -60000 ||
-        tradeAge > MAX_EXCHANGE_TRADE_AGE_MS)continue;
+        tradeAge > MAX_EXCHANGE_TRADE_AGE_MS || tradeTime>ms+60000)continue;
       if(!a.quote || !Number.isFinite(Number(a.quote.price_usdt)) ||
         Number(a.quote.price_usdt)<=0 || !a.kline_4h || !a.kline_1d)continue;
       verified[coin]={status:"RECENT_VERIFIED",source:"Gate Global SPOT",
