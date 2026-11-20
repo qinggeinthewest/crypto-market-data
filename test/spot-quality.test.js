@@ -15,7 +15,7 @@ const row=(minutesAgo,assets)=>({
  payload:JSON.stringify({assets,generated_at_utc:new Date(at-minutesAgo*60000).toISOString()})
 });
 test("five fresh coins remain independently available when PENDLE last trade is stale",()=>{
- const assets=Object.fromEntries(COINS.map(c=>[c,asset(c)]));
+ const assets=Object.fromEntries(COINS.map(c=>[c,asset(c,3)]));
  assets.PENDLE={status:"UNKNOWN",errors:["trades:LATEST_TRADE_STALE_OVER_5_MIN"],
   quote:{price_usdt:1.35},kline_4h:{},kline_1d:{}};
  const out=mergeSpotRows([row(2,assets)],at);
@@ -27,9 +27,9 @@ test("five fresh coins remain independently available when PENDLE last trade is 
  assert.equal(out.assets.PENDLE.last_attempt.original_status,"UNKNOWN");
 });
 test("older per-coin verified row can fill recent gap but not stale data",()=>{
- const first=Object.fromEntries(COINS.map(c=>[c,asset(c)]));
+ const first=Object.fromEntries(COINS.map(c=>[c,asset(c,3)]));
  first.PENDLE={status:"UNKNOWN",errors:["STALE_TRADE"]};
- const second=Object.fromEntries(COINS.map(c=>[c,asset(c)]));
+ const second=Object.fromEntries(COINS.map(c=>[c,asset(c,9)]));
  second.BTC={status:"UNKNOWN",errors:["TEMP_FAIL"]};
  const out=mergeSpotRows([row(2,first),row(8,second)],at);
  assert.equal(out.status,"RECENT_ALL_SIX");
