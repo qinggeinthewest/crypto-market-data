@@ -283,12 +283,86 @@ async function gateTradeFreshness(){
   assets};
 }
 
+
+// Phase 2: Gate-only live market snapshot and optional R2 durable archive.
+// NOTE: Not yet a trading-signal feed until recurring collection & R2 retention are verified.
+async function gateVerifiedCoin(coin,now){
+ const venue=GATE_HOSTS[0],pair=coin+"_USDT";
+ const [candlesResult,tradesResult]=await Promise.allSettled([
+  gateCoin(coin,venue,now),
+  gateRequest(venue.host,"/spot/trades",{currency_pair:pair,limit:"3"})
+ ]);
+ const asset=candlesResult.status==="fulfilled"?candlesResult.value:
+  {pair,status:"INCOMPLETE",errors:["candles:"+String(candlesResult.reason)]};
+ asset.errors=asset.errors||[];
+ if(tradesResult.status==="fulfilled"){
+  try {
+   const trades=tradesResult.value.map(t=>({
+    ts:Number(t.create_time_ms??Number(t.create_time)*1000),
+    price:Number(t.price),id:String(t.id??"")
+   })).filter(x=>Number.isFinite(x.ts)&&x.ts>1500000000000&&
+    Number.isFinite(x.price)&&x.price>0).sort((a,b)=>b.ts-a.ts);
+   if(!trades.length)throw Error("NO_VALID_TRADE_WITH_TIMESTAMP");
+   const last=trades[0],age=now-last.ts;
+   if(age< -60000)throw Error("TRADE_TIMESTAMP_FUTURE");
+   if(age>5*60000)throw Error("LATEST_TRADE_STALE_OVER_5_MIN");
+   asset.latest_trade={price_usdt:last.price,id:last.id,exchange_time_utc:iso(last.ts),age_seconds:Math.round(age/1000)};
+   if(!asset.quote)throw Error("CANDLE_OR_TICKER_INCOMPLETE");
+   const diff=Math.abs(asset.quote.price_usdt-last.price)/last.price*100;
+   asset.ticker_vs_trade_diff_pct=Math.round(diff*10000)/10000;
+   if(diff>1)throw Error("TICKER_LAST_TRADE_DIVERGENCE_OVER_1_PCT");
+  }catch(e){asset.errors.push("trades:"+e.message);}
+ }else asset.errors.push("trades:"+String(tradesResult.reason));
+ asset.status=asset.errors.length===0&&asset.kline_4h&&asset.kline_1d&&asset.latest_trade?
+  "READY":"UNKNOWN";
+ return asset;
+}
+async function gateValidatedSnapshot(){
+ const now=Date.now(),res=await Promise.allSettled(COINS.map(c=>gateVerifiedCoin(c,now)));
+ const assets=Object.fromEntries(COINS.map((c,i)=>[c,res[i].status==="fulfilled"?res[i].value:
+  {pair:c+"_USDT",status:"UNKNOWN",errors:[String(res[i].reason)]}]));
+ const ready=Object.values(assets).filter(v=>v.status==="READY").length;
+ return {schema_version:"0.2.0",generated_at_utc:iso(now),source:"Gate Global SPOT public REST",
+  dataset_status:ready===6?"READY":"INCOMPLETE",ready_symbols:ready,total_symbols:6,
+  data_scope:"Latest verified quotes and last four completed 4H/1D candles; not long-term history.",
+  limitations:"No OI, liquidation, funding, full multi-venue redundancy or trade execution.",
+  assets};
+}
+async function saveGateSnapshot(env,snapshot,trigger){
+ if(!env?.MARKET_ARCHIVE)return {storage:"NOT_CONFIGURED",persisted:false};
+ const stamp=snapshot.generated_at_utc.replace(/[:.]/g,"-");
+ const day=snapshot.generated_at_utc.slice(0,10).replaceAll("-","/");
+ const key="snapshots/"+day+"/"+stamp+".json";
+ const info={timestamp_utc:snapshot.generated_at_utc,trigger,
+  dataset_status:snapshot.dataset_status,ready_symbols:snapshot.ready_symbols,
+  schema_version:snapshot.schema_version,archive_key:key};
+ const opts={httpMetadata:{contentType:"application/json"}};
+ // Keep every attempted poll separately; the latest-good pointer updates only on 6/6 success.
+ await env.MARKET_ARCHIVE.put(key,JSON.stringify(snapshot),opts);
+ if(snapshot.dataset_status==="READY")
+  await env.MARKET_ARCHIVE.put("current/latest.json",JSON.stringify(snapshot),opts);
+ await env.MARKET_ARCHIVE.put("current/status.json",JSON.stringify(info),opts);
+ return {storage:"R2",persisted:true,archive_key:key,latest_good_updated:snapshot.dataset_status==="READY"};
+}
+async function gateLastSaved(env){
+ if(!env?.MARKET_ARCHIVE)return {status:"STORAGE_NOT_CONFIGURED"};
+ const [obj,statusObj]=await Promise.all([
+  env.MARKET_ARCHIVE.get("current/latest.json"),env.MARKET_ARCHIVE.get("current/status.json")
+ ]);
+ if(!obj)return {status:"NO_SAVED_GOOD_SNAPSHOT",last_attempt:statusObj?await statusObj.json():null};
+ const content=await obj.json(),age=Date.now()-Date.parse(content.generated_at_utc);
+ return {status:age<=30*60000&&age>=-60000?"FRESH":"STALE",
+  age_minutes:Math.round(age/60000),
+  last_attempt:statusObj?await statusObj.json():null,
+  snapshot:content};
+}
+
 export default {
- async fetch(request){
+ async fetch(request,env){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
-  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.1.0",
-   worker_running:true,data_verified:false,persistence_enabled:false,at_utc:iso(Date.now())});
+  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.2.0",
+   worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_ARCHIVE),at_utc:iso(Date.now())});
   if(url.pathname==="/gate-trades"){
    try{return respond(await gateTradeFreshness());}
    catch(e){return respond({qualification:"INCOMPLETE",error:String(e)},503);}
@@ -301,19 +375,30 @@ export default {
    try{return respond(await sourceDiagnostics());}
    catch(e){return respond({error:String(e)},503);}
   }
+  if(url.pathname==="/latest"){
+   const data=await gateLastSaved(env);
+   return respond(data,data.status==="FRESH"?200:503);
+  }
   if(url.pathname==="/snapshot"){
-   try{const data=await collect();return respond(data,data.dataset_status==="READY"?200:503);}
+   try{const data=await gateValidatedSnapshot();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/sources","/gate-snapshot","/gate-trades"],
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/sources","/gate-snapshot","/gate-trades"],
    phase:"1: read-only probes"});
   return respond({error:"NOT_FOUND"},404);
  },
- async scheduled(controller){
-  const data=await collect();
-  console.log(JSON.stringify({event:"crypto-market-data-check",scheduled_at_utc:iso(controller.scheduledTime),
-   status:data.dataset_status,ready:data.ready_symbols,
-   failures:Object.fromEntries(Object.entries(data.assets).filter(([,x])=>x.status!=="READY").map(([c,x])=>[c,x.errors]))}));
-  if(data.dataset_status!=="READY")throw Error("DATA_INCOMPLETE_"+data.ready_symbols+"_OF_6");
+ async scheduled(controller,env){
+  const snapshot=await gateValidatedSnapshot();
+  let saved;
+  try{saved=await saveGateSnapshot(env,snapshot,"cron");}
+  catch(e){console.error("R2_STORAGE_FAILURE",String(e));throw e;}
+  console.log(JSON.stringify({event:"gate-spot-collector",
+   scheduled_at_utc:iso(controller.scheduledTime),status:snapshot.dataset_status,
+   ready:snapshot.ready_symbols,persistence:saved,
+   failures:Object.fromEntries(Object.entries(snapshot.assets)
+     .filter(([,a])=>a.status!=="READY").map(([coin,a])=>[coin,a.errors]))}));
+  if(snapshot.dataset_status!=="READY")
+   throw Error("GATE_DATA_INCOMPLETE_"+snapshot.ready_symbols+"_OF_6");
+  if(!saved.persisted)console.warn("GATE_READY_BUT_NOT_PERSISTED: Create and bind Cloudflare R2 MARKET_ARCHIVE");
  }
 };
