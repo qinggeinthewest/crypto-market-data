@@ -386,7 +386,7 @@ export default {
  async fetch(request,env){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
-  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.2.0",
+  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.3.0",
    worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_DB),at_utc:iso(Date.now())});
   if(url.pathname==="/gate-trades"){
    try{return respond(await gateTradeFreshness());}
