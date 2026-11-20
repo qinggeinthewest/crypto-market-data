@@ -16,7 +16,7 @@ jobs:
           set -euo pipefail
           response=$(curl -fsS --connect-timeout 5 --max-time 15 "$WORKER_URL/health")
           echo "$response" | jq -c '{service,version,worker_running,persistence_enabled,at_utc}'
-          if ! echo "$response" | jq -e '.version == "0.4.0-phase3a" and .worker_running == true and .persistence_enabled == true' >/dev/null; then
+          if ! echo "$response" | jq -e '.version == "0.4.1-phase3a" and .worker_running == true and .persistence_enabled == true' >/dev/null; then
             echo "::error::Live Worker version or D1 binding not verified"
             exit 1
           fi
@@ -25,7 +25,7 @@ jobs:
           WORKER_URL: https://crypto-market-data.qinggeinthewest.workers.dev
         run: |
           set -euo pipefail
-          for route in derivatives-audit derivatives-latest audit; do
+          for route in derivatives-audit derivatives-latest audit latest-assets; do
             echo "Checking $route"
             response=$(curl -fsS --connect-timeout 5 --max-time 20 "$WORKER_URL/$route")
             echo "$response" | jq -c '{status,checked_at_utc,storage,expected_slots_since_first_record,recorded_slots,ready_slots,latest_age_minutes,assets: (if .assets then (.assets | with_entries(.value = {recorded_slots: .value.recorded_slots,complete_slots: .value.complete_slots,latest: .value.latest,latest_sample_utc: .value.latest_sample_utc, fresh: .value.fresh, sample_age_minutes: .value.sample_age_minutes})) else null end)}'
@@ -34,6 +34,9 @@ jobs:
               exit 1
             fi
             status=$(echo "$response" | jq -r '.status')
+            if [[ "$route" == "latest-assets" ]]; then
+              echo "$response" | jq -c '{status,verified_coins,verified_symbols,missing_or_unverified_symbols}'
+            fi
             if [[ "$status" == "STORAGE_NOT_CONFIGURED" || "$status" == "D1_QUERY_FAILED" || "$status" == "NO_PERSISTED_RUNS" ]]; then
               echo "::error::/$route returned $status: code is deployed but historical data not yet verified."
               exit 1
