@@ -73,3 +73,40 @@ test("collector persists all six independently and reports public liquidation ze
     assert.equal(calls.length,18);
   }finally {globalThis.fetch=originalFetch;}
 });
+
+test("shared free-plan request budget marks saturated liquidation windows incomplete",async()=>{
+  const originalFetch=globalThis.fetch;
+  const at=Date.parse("2026-11-20T09:30:30Z");
+  let requests=0;
+  globalThis.fetch=async url=>{
+    const u=new URL(url),type=u.pathname,contract=u.searchParams.get("contract");
+    requests++;
+    if(type.endsWith("/contract_stats"))return {ok:true,json:async()=>[
+      {time:Math.floor((at-300000)/1000),open_interest:100,
+        open_interest_usd:100000,long_liq_usd_new:1,short_liq_usd_new:0}
+    ]};
+    if(type.endsWith("/funding_rate"))return {ok:true,json:async()=>[
+      {t:Math.floor((at-3600000)/1000),r:0.000001}
+    ]};
+    if(type.endsWith("/liq_orders")){
+      const from=Number(u.searchParams.get("from"));
+      const to=Number(u.searchParams.get("to"));
+      // Every full 30m page saturates. Split halves return fewer records.
+      const count=to-from>=1700?100:2;
+      return {ok:true,json:async()=>Array.from({length:count},(_,i)=>({
+        time:from+Math.min(i,Math.max(0,to-from)),
+        contract,size:"1",order_size:"-1",order_price:"100",
+        fill_price:String(100+i)
+      }))};
+    }
+    throw Error("Unexpected API");
+  };
+  try {
+    const result=await collectAndSaveDerivatives({MARKET_DB:new FakeDB()},at);
+    assert.equal(result.saved,6);
+    assert.equal(result.status,"PARTIAL");
+    assert.ok(result.liquidation_extra_fetches_used<=6);
+    assert.ok(requests<=24); // excludes 24 independent spot requests
+    assert.ok(result.outcomes.some(x=>x.liquidations==="INCOMPLETE"));
+  } finally {globalThis.fetch=originalFetch;}
+});
