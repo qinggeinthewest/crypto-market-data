@@ -42,3 +42,10 @@ D1 新表：
 Workers Free 每次最多50次外部请求。当前单轮约24次现货 + 18次衍生品基础请求 + 最多6次强平拆分请求 = 48次，留2次余量。Cloudflare Free 的 D1/Workers 配额要持续核查；该设计仅限制程序发起的请求数量，意外重定向及其他消耗仍需监控。
 
 官方资料：https://www.gate.com/docs/developers/apiv4/en/futures/ ；https://developers.cloudflare.com/d1/worker-api/d1-database/ ；https://developers.cloudflare.com/d1/platform/pricing/
+
+## Phase 3A.1：现货币种级独立读取
+
+- 旧 `GET /latest` 保持原语义：只返回最近一条六币全部 READY 的现货快照；若此前6/6样本过期，仍会标记 STALE。
+- 新 `GET /latest-assets` 从最近12个 D1 现货快照中，为每个币独立选取最近一条经过真实成交时间校验的记录；最近快照采集时间不得超过20分钟、交易所最后成交时间不得超过15分钟，交易所成交时间也不能晚于快照本身。合并不同时间槽时，每个币独立标注各自原始样本时间。
+- `RECENT_PARTIAL` 不是六币全通过。若PENDLE现货超过5分钟没有成交、原始快照将PENDLE标记UNKNOWN，新接口会单独报告 `NO_RECENT_VERIFIED_SPOT`，保留错误原因，同时仍提供BTC/ETH/SOL/LINK/ONDO各自经过验证的数据。
+- `RECENT_VERIFIED` 只表示来自历史D1样本、满足设定时效，不等于毫秒级实时行情或买入信号。接口不引入新的外部 API 请求，不放松既有 `/snapshot` 资格标准。
