@@ -382,6 +382,41 @@ async function gateLastSaved(env){
 }
 
 
+
+// Read-only D1 operations audit: measures actual persisted 15-min slots, not claimed uptime.
+async function gateStorageAudit(env){
+ if(!env?.MARKET_DB)return {status:"STORAGE_NOT_CONFIGURED",storage:"D1"};
+ const now=Date.now(),currentSlot=Math.floor(now/D1_SLOT_MS),startSlot=currentSlot-95;
+ try{
+  const q=await env.MARKET_DB.prepare(
+   "SELECT slot,collected_at_ms,status,ready_count FROM crypto_snapshots "+
+   "WHERE slot >= ?1 ORDER BY slot DESC LIMIT 96").bind(startSlot).all();
+  const rows=q.results||[];
+  if(!rows.length)return {status:"NO_PERSISTED_RUNS",storage:"D1",
+   period:"last_24h",checked_at_utc:iso(now)};
+  const slots=new Map(rows.map(r=>[Number(r.slot),r]));
+  const first=Math.min(...slots.keys()),last=Math.max(...slots.keys());
+  const missing=[];
+  for(let slot=first;slot<=last;slot++)if(!slots.has(slot))missing.push(iso(slot*D1_SLOT_MS));
+  const ready=rows.filter(r=>r.status==="READY"&&Number(r.ready_count)===6).length;
+  const incomplete=rows.length-ready;
+  const latest=slots.get(last);
+  const ageMinutes=Math.round((now-Number(latest.collected_at_ms))/60000);
+  return {status:incomplete>0||missing.length>0?"ISSUES_DETECTED":
+   rows.length<4?"INSUFFICIENT_OBSERVATIONS":"NO_ISSUES_IN_OBSERVED_INTERVAL",
+   storage:"D1",period:"rolling_24h",
+   checked_at_utc:iso(now),first_observed_utc:iso(first*D1_SLOT_MS),
+   last_observed_utc:iso(Number(latest.collected_at_ms)),
+   latest_age_minutes:ageMinutes,
+   recorded_slots:rows.length,ready_slots:ready,incomplete_slots:incomplete,
+   missing_slots_between_first_and_last:missing.length,
+   first_missing_slot_utc:missing.slice(0,10),
+   ready_percent_among_recorded:Math.round(10000*ready/rows.length)/100,
+   disclaimer:"Missing count excludes time before first observation and after latest; not an SLA uptime guarantee. R2 and derivatives coverage remain unavailable."};
+ }catch(e){return {status:"D1_QUERY_FAILED",storage:"D1",
+  error:String(e?.message||e).slice(0,220)};}
+}
+
 export default {
  async fetch(request,env){
   const url=new URL(request.url);
@@ -400,6 +435,10 @@ export default {
    try{return respond(await sourceDiagnostics());}
    catch(e){return respond({error:String(e)},503);}
   }
+  if(url.pathname==="/audit"){
+   const report=await gateStorageAudit(env);
+   return respond(report,report.status==="D1_QUERY_FAILED"||report.status==="STORAGE_NOT_CONFIGURED"?503:200);
+  }
   if(url.pathname==="/latest"){
    const data=await gateLastSaved(env);
    return respond(data,data.status==="FRESH"?200:503);
@@ -408,7 +447,7 @@ export default {
    try{const data=await gateValidatedSnapshot();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/sources","/gate-snapshot","/gate-trades"],
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/audit","/sources","/gate-snapshot","/gate-trades"],
    phase:"2B: Gate read-only probes plus D1 cron persistence when binding configured"});
   return respond({error:"NOT_FOUND"},404);
  },
