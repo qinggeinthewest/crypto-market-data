@@ -228,12 +228,71 @@ async function gateSnapshot(){
   ],venues};
 }
 
+
+// Phase 1C: verify actual public trade timestamps for six Gate Global spot pairs.
+// Nothing here persists data or promotes signals to production.
+async function gateTradeFreshness(){
+ const venue=GATE_HOSTS[0],now=Date.now();
+ const all=await Promise.allSettled(COINS.map(async coin=>{
+  const pair=coin+"_USDT";
+  const r=await Promise.allSettled([
+   gateRequest(venue.host,"/spot/trades",{currency_pair:pair,limit:"3"}),
+   gateRequest(venue.host,"/spot/tickers",{currency_pair:pair})
+  ]);
+  const o={pair,status:"UNKNOWN",errors:[]};
+  if(r[0].status==="fulfilled"){
+   try{
+    const candidates=r[0].value.map(t=>{
+     const ts=Number(t.create_time_ms??Number(t.create_time)*1000);
+     const price=Number(t.price);
+     return {ts,price,id:String(t.id??"")};
+    }).filter(x=>Number.isFinite(x.ts)&&x.ts>1500000000000&&
+        Number.isFinite(x.price)&&x.price>0).sort((a,b)=>b.ts-a.ts);
+    if(!candidates.length)throw Error("NO_VALID_TRADE_WITH_TIMESTAMP");
+    const trade=candidates[0],age=now-trade.ts;
+    o.latest_trade={id:trade.id,price_usdt:trade.price,
+     exchange_trade_time_utc:iso(trade.ts),
+     age_seconds:Math.round(age/1000)};
+    if(age< -60*1000)throw Error("TRADE_TIMESTAMP_IN_FUTURE");
+    if(age>5*60*1000)throw Error("TRADE_STALE_GT_5_MIN");
+   }catch(e){o.errors.push("trades:"+e.message);}
+  }else o.errors.push("trades:"+String(r[0].reason));
+  if(r[1].status==="fulfilled"){
+   try{
+    const ticker=r[1].value.find(x=>x.currency_pair===pair);
+    const p=Number(ticker?.last);
+    if(!Number.isFinite(p)||p<=0)throw Error("INVALID_TICKER");
+    o.ticker={price_usdt:p,trade_time_not_in_ticker:true};
+    if(o.latest_trade){
+     const pct=Math.abs(p-o.latest_trade.price_usdt)/o.latest_trade.price_usdt*100;
+     o.ticker_vs_last_trade_diff_pct=Math.round(pct*10000)/10000;
+     if(pct>1)throw Error("TRADE_TICKER_DIVERGENCE_GT_1_PCT");
+    }
+   }catch(e){o.errors.push("ticker:"+e.message);}
+  }else o.errors.push("ticker:"+String(r[1].reason));
+  if(o.errors.length===0&&o.latest_trade&&o.ticker)o.status="FRESH_VALIDATED";
+  return o;
+ }));
+ const assets=Object.fromEntries(COINS.map((c,i)=>[c,all[i].status==="fulfilled"?
+  all[i].value:{pair:c+"_USDT",status:"UNKNOWN",errors:[String(all[i].reason)]}]));
+ const ready=Object.values(assets).filter(x=>x.status==="FRESH_VALIDATED").length;
+ return {phase:"GATE_PUBLIC_LAST_TRADE_TIME_VERIFICATION",venue:"Gate Global",
+  generated_at_utc:iso(now),fresh_trade_pairs:ready,total_pairs:6,
+  qualification:ready===6?"SIX_TRADES_FRESH":"INCOMPLETE",
+  note:"Public trades timestamps, positive prices, and ticker/trade divergence <=1%. Still NOT production-ready without persistence and end-to-end Cron verification.",
+  assets};
+}
+
 export default {
  async fetch(request){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
   if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.1.0",
    worker_running:true,data_verified:false,persistence_enabled:false,at_utc:iso(Date.now())});
+  if(url.pathname==="/gate-trades"){
+   try{return respond(await gateTradeFreshness());}
+   catch(e){return respond({qualification:"INCOMPLETE",error:String(e)},503);}
+  }
   if(url.pathname==="/gate-snapshot"){
    try{return respond(await gateSnapshot());}
    catch(e){return respond({dataset_status:"NOT_PRODUCTION_READY",error:String(e)},503);}
@@ -246,7 +305,7 @@ export default {
    try{const data=await collect();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/sources","/gate-snapshot"],
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/sources","/gate-snapshot","/gate-trades"],
    phase:"1: read-only probes"});
   return respond({error:"NOT_FOUND"},404);
  },
