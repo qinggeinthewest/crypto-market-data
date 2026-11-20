@@ -23,6 +23,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: true
+      - name: Use independent public-market-feed branch (never commit data to main)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin public-market-feed:refs/remotes/origin/public-market-feed
+          git switch --track -c public-market-feed origin/public-market-feed
       - name: Read only from the deployed Cloudflare Worker
         env:
           WORKER_URL: https://crypto-market-data.qinggeinthewest.workers.dev
@@ -143,4 +149,4 @@ jobs:
             exit 0
           fi
           git commit -m "data: update public crypto monitor feed [skip ci]"
-          git push
+          git push origin HEAD:refs/heads/public-market-feed
