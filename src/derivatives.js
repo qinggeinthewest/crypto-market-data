@@ -68,13 +68,20 @@ function parseFunding(coin,rows,at) {
 // Gate's public liq_orders endpoint has a 3600-second range ceiling but NO
 // documented offset/cursor pagination. On a full page we split time windows;
 // if even split windows remain capped, mark partial and do not assert completeness.
-async function getLiquidations(coin,at) {
+async function getLiquidations(coin,at,sharedBudget) {
   const contract=coin+"_USDT";
   const from=Math.floor(at/1000)-1800,to=Math.floor(at/1000);
   const events=new Map();
   let requests=0,truncated=false,invalid_rows=0;
   async function query(a,b) {
     if(requests>=LIQ_CALL_BUDGET) {truncated=true;return;}
+    // 24 spot + 18 normal futures fetches = 42 requests. Allow at most
+    // 6 additional split requests across ALL coins: <=48 external requests
+    // per 15-minute Worker invocation on Cloudflare Workers Free.
+    if(requests>0) {
+      if(sharedBudget.remaining<=0){truncated=true;return;}
+      sharedBudget.remaining--;
+    }
     requests++;
     const items=await gateArray("/futures/usdt/liq_orders",
       {contract,from:a,to:b,limit:LIQ_LIMIT});
@@ -113,12 +120,12 @@ async function getLiquidations(coin,at) {
   }
 }
 
-async function collectCoin(coin,at) {
+async function collectCoin(coin,at,sharedBudget) {
   const contract=coin+"_USDT";
   const [statsRes,fundingRes,liqRes] = await Promise.allSettled([
     gateArray("/futures/usdt/contract_stats",{contract,interval:"5m",limit:24}),
     gateArray("/futures/usdt/funding_rate",{contract,limit:4}),
-    getLiquidations(coin,at)
+    getLiquidations(coin,at,sharedBudget)
   ]);
   const stats=statsRes.status==="fulfilled" ?
     parseStats(coin,statsRes.value,at):
@@ -172,7 +179,8 @@ async function saveCoin(db,entry,at,slot) {
 export async function collectAndSaveDerivatives(env,at=Date.now()) {
   if(!env?.MARKET_DB) return {phase:"3A",status:"STORAGE_NOT_CONFIGURED",saved:0};
   const db=env.MARKET_DB,slot=Math.floor(at/SLOT_MS);
-  const settled=await Promise.allSettled(COINS.map(coin=>collectCoin(coin,at)));
+  const sharedBudget={remaining:6};
+  const settled=await Promise.allSettled(COINS.map(coin=>collectCoin(coin,at,sharedBudget)));
   await ensureTables(db);
   const outcomes=[],errors=[];
   for(let i=0;i<COINS.length;i++) {
@@ -203,6 +211,7 @@ export async function collectAndSaveDerivatives(env,at=Date.now()) {
   return {phase:"3A",status:!errors.length&&outcomes.length===6 &&
     outcomes.every(x=>x.quality==="DATA_COLLECTED") ? "ALL_COLLECTED":"PARTIAL",
     collected_at_utc:iso(at),slot,saved:outcomes.length,outcomes,errors,
+    liquidation_extra_fetches_used:6-sharedBudget.remaining,
     note:"Gate single-venue public observations; never market-wide liquidation totals or trading signals"};
 }
 
