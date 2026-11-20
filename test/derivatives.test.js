@@ -25,7 +25,7 @@ test("1h and 4h OI need sufficient continuous historical observations",()=>{
 });
 test("missing samples invalidate OI window instead of producing false confidence",()=>{
   const at=Date.parse("2026-11-20T09:20:00Z");
-  const history=buildRows(30,at,{gaps:[16,17,18,19,20,21,22]});
+  const history=buildRows(30,at,{gaps:[20,21,22,23,24,25,26]});
   assert.equal(calculateDerivativeMetrics(history).oi_change_1h.state,"INCOMPLETE_HISTORY");
 });
 
