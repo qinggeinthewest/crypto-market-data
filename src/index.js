@@ -1,4 +1,6 @@
 // Phase 1: public-market-data diagnostics only. No secrets, orders, or stored state.
+import { collectAndSaveDerivatives, derivativesAudit, derivativesLatest } from "./derivatives.js";
+
 const COINS=["BTC","ETH","SOL","LINK","PENDLE","ONDO"];
 const HOUR=3600000;
 const respond=(data,status=200)=>new Response(JSON.stringify(data,null,2),{
@@ -531,7 +533,7 @@ export default {
  async fetch(request,env){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
-  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.3.1",
+  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.4.0-phase3a",
    worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_DB),at_utc:iso(Date.now())});
   if(url.pathname==="/gate-trades"){
    try{return respond(await gateTradeFreshness());}
@@ -549,6 +551,14 @@ export default {
    try{return respond(await gateDerivativeProbe());}
    catch(e){return respond({phase:"PUBLIC_DERIVATIVES_READ_ONLY_PROBE",error:String(e)},503);}
   }
+  if(url.pathname==="/derivatives-audit"){
+   const report=await derivativesAudit(env);
+   return respond(report,["D1_QUERY_FAILED","STORAGE_NOT_CONFIGURED"].includes(report.status)?503:200);
+  }
+  if(url.pathname==="/derivatives-latest"){
+   const report=await derivativesLatest(env);
+   return respond(report,["D1_QUERY_FAILED","STORAGE_NOT_CONFIGURED"].includes(report.status)?503:200);
+  }
   if(url.pathname==="/audit"){
    const report=await gateStorageAudit(env);
    return respond(report,report.status==="D1_QUERY_FAILED"||report.status==="STORAGE_NOT_CONFIGURED"?503:200);
@@ -561,22 +571,37 @@ export default {
    try{const data=await gateValidatedSnapshot();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/audit","/derivatives-probe","/sources","/gate-snapshot","/gate-trades"],
-   phase:"2B: Gate read-only probes plus D1 cron persistence when binding configured"});
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/audit","/derivatives-probe","/derivatives-latest","/derivatives-audit","/sources","/gate-snapshot","/gate-trades"],
+   phase:"3A: independent spot and derivatives D1 collectors; read-only historical metrics"});
   return respond({error:"NOT_FOUND"},404);
  },
  async scheduled(controller,env){
-  const snapshot=await gateValidatedSnapshot();
-  let saved;
-  try{saved=await saveGateSnapshot(env,snapshot,"cron");}
-  catch(e){console.error("D1_STORAGE_FAILURE",String(e));throw e;}
-  console.log(JSON.stringify({event:"gate-spot-collector",
-   scheduled_at_utc:iso(controller.scheduledTime),status:snapshot.dataset_status,
-   ready:snapshot.ready_symbols,persistence:saved,
-   failures:Object.fromEntries(Object.entries(snapshot.assets)
-     .filter(([,a])=>a.status!=="READY").map(([coin,a])=>[coin,a.errors]))}));
-  if(snapshot.dataset_status!=="READY")
-   throw Error("GATE_DATA_INCOMPLETE_"+snapshot.ready_symbols+"_OF_6");
-  if(!saved.persisted)console.warn("GATE_READY_BUT_NOT_PERSISTED: Create and bind Cloudflare D1 MARKET_DB");
+  // Both collectors run independently; a failure in one cannot skip the other.
+  const [spot,derivatives]=await Promise.allSettled([
+   (async()=>{
+    const snapshot=await gateValidatedSnapshot();
+    const saved=await saveGateSnapshot(env,snapshot,"cron");
+    console.log(JSON.stringify({event:"gate-spot-collector",
+     scheduled_at_utc:iso(controller.scheduledTime),status:snapshot.dataset_status,
+     ready:snapshot.ready_symbols,persistence:saved}));
+    if(snapshot.dataset_status!=="READY")
+     throw Error("GATE_DATA_INCOMPLETE_"+snapshot.ready_symbols+"_OF_6");
+    if(!saved.persisted)throw Error("GATE_SPOT_NOT_PERSISTED");
+    return {status:"READY",saved};
+   })(),
+   collectAndSaveDerivatives(env,controller.scheduledTime)
+  ]);
+  if(derivatives.status==="fulfilled"){
+   const summary=derivatives.value;
+   console.log(JSON.stringify({event:"gate-derivatives-collector",
+    scheduled_at_utc:iso(controller.scheduledTime),...summary}));
+   if(summary.status==="PARTIAL")console.warn("GATE_DERIVATIVES_PARTIAL");
+  }else{
+   console.error("GATE_DERIVATIVES_FAILURE",String(derivatives.reason));
+  }
+  if(spot.status==="rejected")throw spot.reason;
+  if(derivatives.status==="rejected")throw derivatives.reason;
+  if(derivatives.value.errors?.length)
+   throw Error("GATE_DERIVATIVES_STORAGE_PARTIAL");
  }
 };
