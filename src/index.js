@@ -1,5 +1,6 @@
 // Phase 1: public-market-data diagnostics only. No secrets, orders, or stored state.
 import { collectAndSaveDerivatives, derivativesAudit, derivativesLatest } from "./derivatives.js";
+import { mergeSpotRows } from "./spot-quality.js";
 
 const COINS=["BTC","ETH","SOL","LINK","PENDLE","ONDO"];
 const HOUR=3600000;
@@ -365,6 +366,20 @@ async function saveGateSnapshot(env,snapshot,trigger){
   bytes,write_count:write.meta?.rows_written??null,trigger,
   retention_days:D1_KEEP_DAYS};
 }
+// Independent latest per-coin D1 snapshots. A thin PENDLE spot market must
+// not invalidate a recent verified BTC/ETH/SOL/LINK/ONDO record.
+async function gateLatestSpotAssets(env){
+ if(!env?.MARKET_DB)return {status:"STORAGE_NOT_CONFIGURED",storage:"D1"};
+ try{
+  const q=await env.MARKET_DB.prepare(
+   "SELECT collected_at_ms,payload FROM crypto_snapshots ORDER BY slot DESC LIMIT 12"
+  ).all();
+  return mergeSpotRows(q.results||[],Date.now());
+ }catch(e){
+  return {status:"D1_QUERY_FAILED",storage:"D1",
+   error:String(e?.message||e).slice(0,180)};
+ }
+}
 async function gateLastSaved(env){
  const db=env?.MARKET_DB;
  if(!db)return {status:"STORAGE_NOT_CONFIGURED",storage:"D1",persistence_enabled:false};
@@ -533,7 +548,7 @@ export default {
  async fetch(request,env){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
-  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.4.0-phase3a",
+  if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.4.1-phase3a",
    worker_running:true,data_verified:false,persistence_enabled:Boolean(env?.MARKET_DB),at_utc:iso(Date.now())});
   if(url.pathname==="/gate-trades"){
    try{return respond(await gateTradeFreshness());}
@@ -563,6 +578,10 @@ export default {
    const report=await gateStorageAudit(env);
    return respond(report,report.status==="D1_QUERY_FAILED"||report.status==="STORAGE_NOT_CONFIGURED"?503:200);
   }
+  if(url.pathname==="/latest-assets"){
+   const result=await gateLatestSpotAssets(env);
+   return respond(result,["D1_QUERY_FAILED","STORAGE_NOT_CONFIGURED"].includes(result.status)?503:200);
+  }
   if(url.pathname==="/latest"){
    const data=await gateLastSaved(env);
    return respond(data,data.status==="FRESH"?200:503);
@@ -571,7 +590,7 @@ export default {
    try{const data=await gateValidatedSnapshot();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/audit","/derivatives-probe","/derivatives-latest","/derivatives-audit","/sources","/gate-snapshot","/gate-trades"],
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/latest","/latest-assets","/audit","/derivatives-probe","/derivatives-latest","/derivatives-audit","/sources","/gate-snapshot","/gate-trades"],
    phase:"3A: independent spot and derivatives D1 collectors; read-only historical metrics"});
   return respond({error:"NOT_FOUND"},404);
  },
