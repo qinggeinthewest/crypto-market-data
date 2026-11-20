@@ -1,33 +1,44 @@
-# Crypto Market Data — Phase 2B (Gate + Cloudflare D1)
+# Crypto Market Data — Phase 3A (Gate Spot + Derivatives + D1)
 
-独立于 518880 黄金ETF项目的加密货币公开数据服务。当前不进行自动交易，也未具备正式策略信号所需的完整衍生品数据。
+独立于黄金 ETF 项目的加密货币**公开市场数据**服务，不连接交易账户、不读取个人持仓、不存交易密钥、不自动下单。
 
-## 现已验证的范围
-- Bitget现货API从Cloudflare返回403，OKX返回429，Binance公开API返回403。
-- Gate国际站（api.gateio.ws）BTC / ETH / SOL / LINK / PENDLE / ONDO：六币报价、近期4H和1D K线在Cloudflare真实探针中全部通过。
-- Gate公开最近成交：六币均取得带交易所时间戳的真实成交，价格和ticker差异通过检查。上述单次通过不等于保证长期稳定。
+六币：BTC、ETH、SOL、LINK、PENDLE、ONDO。
 
-## 当前Worker接口
-- `/snapshot`：实时获取Gate国际站六币报价、最近成交、4H及1D已收盘K线，验证OHLC/成交量/连续性/新鲜度。仅6/6通过返回200，其余为503。
-- `/latest`：从绑定的D1读取最近有效快照；超过30分钟标记STALE。未绑定或表未初始化时明确返回503。
-- `/health`：Worker及D1绑定诊断，不代表行情全部有效。
-- `/gate-snapshot`：Gate全球站和美国站现货资格探针；`/gate-trades`：六币真实成交时间探针。
-- `/sources`：多来源连通性探针（非正式数据切换）。
+## 原有现货功能
+- Gate Global 现货报价、真实成交、已收盘4H/1D K线校验，15分钟 Cron 写入 D1 的 crypto_snapshots。
+- GET /snapshot、/latest、/audit、/health、/sources、/gate-snapshot、/gate-trades 原有接口保留。
 
-## 自动运行与存储
-- Cron：每15分钟，在Worker上执行六币Gate现货采集。
-- 可选D1数据库绑定变量名：`MARKET_DB`；尚未在`wrangler.jsonc`填写，等待用户先从Cloudflare控制台创建数据库，取得database_id后再更新配置。
-- 绑定后第一次Cron自动建表 `crypto_snapshots`；每15分钟时间槽最多1条（同槽仅在通过数改善时替换）。
-- 单个快照最大160KB。每日最多96个时间槽，数据保留30天，每日UTC零点附近执行清理。
-- 无数据库时仍可诊断，但绝不标记持久化成功。
-- /snapshot为GET只读接口，不允许公众触发写入；D1写入仅由Cron触发。
-- 未经授权不会存储账户API密钥、真实持仓或下单信息。
+## Phase 3A 衍生品采集
+- Gate futures/usdt/contract_stats：每币最近24个5分钟样本，过滤未闭合、过期和无效记录；存储 OI 合约数、OI USD 名义价值及 5m 强平美元金额。
+- Gate futures/usdt/funding_rate：每币最近4条历史已结算资金费率，不能当成未来费率预测。
+- Gate futures/usdt/liq_orders：每币最近30分钟公开强平订单，15分钟 Cron 重叠抓取；接口无公开的 offset/cursor 分页。返回满100条时按时间窗拆分（每币最多4次请求），仍无法完整获取即标记 INCOMPLETE。
+- 公开强平订单无唯一事件ID，用合约、秒级时间、订单大小及价格字段生成稳定指纹；完全相同字段的不同事件可能被合并，事件计数只能视为公开记录的下界。
+- 每轮每币最多保存80条去重强平订单；超限标记 INCOMPLETE，控制 D1 写入量。强平金额优先使用 contract_stats 5分钟聚合，不根据订单数猜测总金额。
+- 现货与衍生品在同一15分钟 Cron 内并行、独立保存，某项数据失败不阻止另一项持久化。
 
-## D1免费配额
-Workers Free下D1每日500万行读取、10万行写入；单数据库500MB，账户总存储5GB。超过免费配额时停止受限数据库操作，而非自动超额计费（前提是账户仍为Workers Free）。请勿升级到付费计划以免改变此保护。来源：https://developers.cloudflare.com/d1/platform/pricing/ 和 https://developers.cloudflare.com/d1/platform/limits/
+D1 新表：
+- derivative_slots：每币每15分钟质量状态、真实请求结果。
+- derivative_stats：5分钟 OI 与聚合强平金额。
+- derivative_funding：已结算历史资金费率。
+- derivative_liq_events：基于稳定指纹去重的 Gate 公开强平订单。
 
-## 仍待完成
-1. 在Cloudflare创建D1数据库 `crypto-market-db`。
-2. 将其ID写入wrangler.jsonc的 `d1_databases`：`binding: MARKET_DB`，然后部署。
-3. 验证真实定时触发、D1读写、故障时不误报READY和连续运行稳定性。
-4. 后续再增加独立备用交易所、OI/资金费率/强平事件的保存。现阶段不能用于正式策略交易信号。
+保存30天，现有 MARKET_DB 绑定不变。
+
+## 新增只读接口
+- GET /derivatives-probe：原有一次性连通性探针，不写D1。
+- GET /derivatives-audit：每币录得/完整/不完整/逾期缺失的15分钟槽，7分钟宽限。
+- GET /derivatives-latest：基于 D1 历史显示 OI 1h/4h/24h 变化，过去30分钟与再前30分钟 Gate 强平金额对比，最近已结算资金费率。历史不足/不连续时明确显示 INSUFFICIENT_HISTORY / INCOMPLETE_HISTORY。
+
+上述指标均为描述性观察，**不生成买卖信号**。Gate 单一交易所不等于全市场；零条公开强平记录不等于无强平。
+
+## 验收
+1. 执行 npm test（Node 内置测试，无额外运行依赖）。
+2. 合并后验证 Cloudflare GitHub 集成或手动部署已发布 main 最新提交；GitHub 合并并不保证已经部署。
+3. 检查 /health 版本 0.4.0-phase3a，persistence_enabled=true。
+4. 下一次实际 Cron 后检查 /derivatives-audit、/derivatives-latest，并用 /audit 验证现货未受影响。
+5. 连续24小时（96个时间槽）检查漏采和数据质量，再用3–7天观察初步稳定性；暂不把这些样本称为历史回测。
+6. Phase 3B 另行增加跨交易所校验、策略回测与信号判定。
+
+Cloudflare Free 的 D1/Workers 配额要持续核查；限额措施并不保证极端行情下绝不超配额。
+
+官方资料：https://www.gate.com/docs/developers/apiv4/en/futures/ ；https://developers.cloudflare.com/d1/worker-api/d1-database/ ；https://developers.cloudflare.com/d1/platform/pricing/
