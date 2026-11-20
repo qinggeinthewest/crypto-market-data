@@ -72,7 +72,7 @@ async function getLiquidations(coin,at) {
   const contract=coin+"_USDT";
   const from=Math.floor(at/1000)-1800,to=Math.floor(at/1000);
   const events=new Map();
-  let requests=0,truncated=false;
+  let requests=0,truncated=false,invalid_rows=0;
   async function query(a,b) {
     if(requests>=LIQ_CALL_BUDGET) {truncated=true;return;}
     requests++;
@@ -87,7 +87,7 @@ async function getLiquidations(coin,at) {
     }
     for(const row of items) {
       const t=validNum(row && row.time);
-      if(row?.contract!==contract || t===null || t<a || t>b)continue;
+      if(row?.contract!==contract || t===null || t<a || t>b){invalid_rows++;continue;}
       // No public event ID. This deterministic fingerprint may merge distinct
       // but byte-for-byte-identical orders: event counts are lower bounds.
       const fields=[coin,t,String(row.size??""),String(row.order_size??""),
@@ -102,11 +102,11 @@ async function getLiquidations(coin,at) {
     await query(from,to);
     const records=[...events.values()];
     const capped=records.length>COIN_EVENT_WRITE_CAP;
-    return {state:truncated || capped ? "INCOMPLETE" :
+    return {state:truncated || capped || invalid_rows>0 ? "INCOMPLETE" :
       records.length ? "EVENTS_REPORTED":"ZERO_REPORTED_BY_GATE",
       records: capped ? records.slice(0,COIN_EVENT_WRITE_CAP):records,
-      reported_unique:records.length,requests,
-      truncated:truncated||capped,window_seconds:1800};
+      reported_unique:records.length,requests,invalid_rows,
+      truncated:truncated||capped||invalid_rows>0,window_seconds:1800};
   } catch(e) {
     return {state:"REQUEST_FAILED",records:[],reported_unique:0,
       requests,truncated:true,error:stateError(e),window_seconds:1800};
@@ -275,7 +275,7 @@ export async function derivativesLatest(env) {
     return {status:"READ_ONLY_HISTORICAL",checked_at_utc:iso(at),venue:"Gate Global USDT perpetual",
       production_ready:false,trade_signal:"NOT_EVALUATED",
       note:"Single venue; 24h metrics require 24h of continuous saved data",assets};
-  }catch(e){return {status:"D1_QUERY_FAILED",error:stateError(e)};}
+  }catch(e){return {status:String(e).includes("no such table")?"NO_PERSISTED_RUNS":"D1_QUERY_FAILED",error:stateError(e)};}
 }
 
 export async function derivativesAudit(env) {
@@ -310,5 +310,5 @@ export async function derivativesAudit(env) {
       checked_at_utc:iso(at),storage:"D1",expected_slots_since_first_record:expected,
       cron:"every 15m UTC; 7m grace",assets,
       limitations:"Cannot establish uptime before first saved row; Gate-only public liquidations may be incomplete; not a trading signal"};
-  }catch(e){return {status:"D1_QUERY_FAILED",error:stateError(e)};}
+  }catch(e){return {status:String(e).includes("no such table")?"NO_PERSISTED_RUNS":"D1_QUERY_FAILED",error:stateError(e)};}
 }
