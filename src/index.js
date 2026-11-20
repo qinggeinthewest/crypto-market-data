@@ -81,17 +81,79 @@ async function collect(){
   dataset_status:ready===COINS.length?"READY":"INCOMPLETE",ready_symbols:ready,total_symbols:6,
   disclaimer:"Diagnostics only; NOT persisted, no derivatives data, no trading signals.",assets};
 }
+
+// Connectivity-only probes. Run on demand to locate a public data source accessible from Cloudflare.
+// This is NOT market-data validation or a fallback feed yet.
+const SOURCE_PROBES=[
+ {name:"OKX",ticker:"https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT",
+  bars:"https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=4H&limit=3"},
+ {name:"Gate Global",ticker:"https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BTC_USDT",
+  bars:"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=BTC_USDT&interval=4h&limit=3"},
+ {name:"Gate US",ticker:"https://api.gate.us/api/v4/spot/tickers?currency_pair=BTC_USDT",
+  bars:"https://api.gate.us/api/v4/spot/candlesticks?currency_pair=BTC_USDT&interval=4h&limit=3"},
+ {name:"Binance Public Data",ticker:"https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT",
+  bars:"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=3"}
+];
+async function sourceRequest(url,venue,kind){
+ try {
+  const res=await fetch(url,{headers:{accept:"application/json"},signal:AbortSignal.timeout(8000)});
+  if(!res.ok)return {http_status:res.status,state:"HTTP_ERROR"};
+  let data;
+  try{data=await res.json();}catch(e){return {http_status:200,state:"NON_JSON_RESPONSE"};}
+  let price=NaN,candles=0,latestTime=NaN;
+  if(venue==="OKX"){
+   if(data?.code!=="0"||!Array.isArray(data.data))throw Error("OKX_APPLICATION_ERROR_"+String(data?.code));
+   if(kind==="ticker")price=Number(data.data[0]?.last);
+   else{candles=data.data.length;latestTime=Math.max(...data.data.map(r=>Number(r[0])));}
+  }else if(venue.startsWith("Gate")){
+   if(!Array.isArray(data))throw Error("GATE_DATA_NOT_ARRAY");
+   if(kind==="ticker")price=Number(data[0]?.last);
+   else{candles=data.length;latestTime=Math.max(...data.map(r=>Number(r[0])*1000));}
+  }else{
+   if(kind==="ticker")price=Number(data?.price);
+   else if(Array.isArray(data)){candles=data.length;latestTime=Math.max(...data.map(r=>Number(r[0])));}
+  }
+  if(kind==="ticker"){
+   if(!Number.isFinite(price)||price<=0)throw Error("INVALID_PRICE");
+   return {http_status:200,state:"VALID_RESPONSE",price_usdt:price,quote_timestamp_verified:false};
+  }
+  if(candles<2||!Number.isFinite(latestTime)||latestTime<1500000000000)throw Error("INVALID_CANDLES");
+  return {http_status:200,state:"VALID_RESPONSE",candles_returned:candles,
+   latest_candle_open_utc:iso(latestTime),
+   latest_open_age_hours:Math.round((Date.now()-latestTime)/HOUR*10)/10};
+ }catch(e){return {state:"ERROR",reason:String(e?.message||e).slice(0,140)};}
+}
+async function sourceDiagnostics(){
+ const checked=await Promise.all(SOURCE_PROBES.map(async p=>{
+  const [ticker,bars]=await Promise.all([
+   sourceRequest(p.ticker,p.name,"ticker"),sourceRequest(p.bars,p.name,"bars")
+  ]);
+  return {venue:p.name,
+   probe_status:ticker.state==="VALID_RESPONSE"&&bars.state==="VALID_RESPONSE"
+    ?"PUBLIC_ENDPOINTS_REACHABLE":"UNAVAILABLE_OR_INCOMPLETE",
+   ticker,candles_4h:bars};
+ }));
+ return {phase:"CONNECTIVITY_ONLY",generated_at_utc:iso(Date.now()),
+  why:"Bitget returned HTTP 403 from Cloudflare on 18 requests. Testing independent venues without any credentials.",
+  warning:"A reachable BTC test does not establish six-asset availability, quote freshness, history continuity, derivatives or automated failover.",
+  results:checked};
+}
+
 export default {
  async fetch(request){
   const url=new URL(request.url);
   if(request.method!=="GET")return respond({error:"METHOD_NOT_ALLOWED"},405);
   if(url.pathname==="/health")return respond({service:"crypto-market-data",version:"0.1.0",
    worker_running:true,data_verified:false,persistence_enabled:false,at_utc:iso(Date.now())});
+  if(url.pathname==="/sources"){
+   try{return respond(await sourceDiagnostics());}
+   catch(e){return respond({error:String(e)},503);}
+  }
   if(url.pathname==="/snapshot"){
    try{const data=await collect();return respond(data,data.dataset_status==="READY"?200:503);}
    catch(e){return respond({dataset_status:"INCOMPLETE",error:String(e)},503);}
   }
-  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot"],
+  if(url.pathname==="/")return respond({service:"crypto-market-data",endpoints:["/health","/snapshot","/sources"],
    phase:"1: read-only probes"});
   return respond({error:"NOT_FOUND"},404);
  },
